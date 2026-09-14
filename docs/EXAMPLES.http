@@ -1,0 +1,74 @@
+# VS Code REST Client examples; Swagger /docs also supports all these requests.
+@base = http://127.0.0.1:8000
+@key = local-demo-key-change-before-deployment
+# Replace these three values with actual responses from order intake/outbox.
+@orderId = REPLACE_ORDER_ID
+@offerId = REPLACE_OFFER_ID
+@token = REPLACE_OFFER_TOKEN
+
+### Database health
+GET {{base}}/health
+
+### Catalog (all prices are paisa)
+GET {{base}}/products
+X-API-Key: {{key}}
+
+### Low-risk order with out-of-stock tea
+POST {{base}}/orders
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "external_id": "web-order-1001",
+  "customer_email": "customer@example.test",
+  "risk_score": 0.1,
+  "payment_method": "prepaid",
+  "preferred_brands": ["Vital"],
+  "items": [{"product_id": 1, "quantity": 1}]
+}
+
+### Observe the order; wait briefly for worker processing
+GET {{base}}/orders/{{orderId}}
+X-API-Key: {{key}}
+
+### Read demo email; copy offer_id and token from payload
+GET {{base}}/orders/{{orderId}}/outbox
+X-API-Key: {{key}}
+
+### Explicit customer approval, authenticated by the one-off offer token
+POST {{base}}/offers/{{offerId}}/reply
+Content-Type: application/json
+
+{"token": "{{token}}", "decision": "accept"}
+
+### New high-risk order
+POST {{base}}/orders
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "external_id": "web-order-1002",
+  "customer_email": "customer@example.test",
+  "risk_score": 0.95,
+  "payment_method": "cod",
+  "items": [{"product_id": 3, "quantity": 1}]
+}
+
+### Set orderId to the high-risk order before approving
+POST {{base}}/orders/{{orderId}}/audit
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"decision": "approve"}
+
+### Retry a failed job after fixing its underlying error
+POST {{base}}/orders/{{orderId}}/retry
+X-API-Key: {{key}}
+
+### Audit trail
+GET {{base}}/orders/{{orderId}}/audit-log
+X-API-Key: {{key}}
+
+### Metrics
+GET {{base}}/metrics
+X-API-Key: {{key}}
