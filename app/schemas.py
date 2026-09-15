@@ -38,3 +38,31 @@ class AuditDecision(BaseModel):
 class CustomerReply(BaseModel):
     token: str = Field(min_length=20, max_length=200)
     decision: Literal["accept", "reject"]
+
+
+class CustomerCancel(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+
+
+class UserCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
+    role: Literal["admin", "auditor", "viewer"] = "viewer"
+
+    @field_validator("email")
+    @classmethod
+    def email_shape(cls, value):
+        if "@" not in value or any(c in value for c in "\r\n "):
+            raise ValueError("Use an email address without whitespace")
+        return value
+
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str

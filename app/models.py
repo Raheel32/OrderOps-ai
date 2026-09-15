@@ -45,6 +45,8 @@ class Order(Base):
     recovered: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     first_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Bearer capability for pre-resolution self-service cancellation (see /orders/{id}/cancel).
+    cancel_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class OrderLine(Base):
@@ -56,7 +58,13 @@ class OrderLine(Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
     quantity: Mapped[int] = mapped_column(Integer)
     unit_price_paisa: Mapped[int] = mapped_column(Integer)
+    # Snapshot at intake; unit_price_paisa mutates when a replacement is accepted.
+    # Needed to compute an exact per-line refund without double-counting dropped lines.
+    original_unit_price_paisa: Mapped[int] = mapped_column(Integer)
     reserved: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True once this line has been excluded from fulfillment (rejected/no alternative)
+    # under partial-order fulfillment. The order can still complete around it.
+    dropped: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Offer(Base):
@@ -102,3 +110,13 @@ class Job(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+    # "admin": full access. "auditor": read + audit decisions. "viewer": read-only.
+    role: Mapped[str] = mapped_column(String(20), default="viewer")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

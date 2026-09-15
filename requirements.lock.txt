@@ -1,4 +1,6 @@
 # Resolved on Python 3.12, 2026-09-13. Install this for the tested dependency set.
+# PyJWT added for per-user auth/RBAC — reinstall with `pip install -r requirements.txt`
+# if your existing venv predates this change.
 Mako==1.4.1
 MarkupSafe==3.0.3
 PyYAML==6.0.3
@@ -38,6 +40,7 @@ pluggy==1.6.0
 psycopg==3.3.5
 psycopg-binary==3.3.5
 psycopg-pool==3.3.1
+PyJWT==2.10.1
 pydantic==2.13.5
 pydantic-settings==2.15.0
 pydantic_core==2.46.5

@@ -4,7 +4,7 @@ import secrets
 from sqlalchemy import select
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Audit, Offer, Order, OrderLine, Outbox, Product, utcnow, uid
+from app.models import Audit, Job, Offer, Order, OrderLine, Outbox, Product, utcnow, uid
 from app.policy import choose_alternative, message_for_offer, offer_price
 from app.agent import recommend
 
@@ -47,7 +47,11 @@ def inventory(order_id):
         order = db.get(Order, order_id, with_for_update=True)
         products = lock_catalog(db)
         missing = []
+        any_active = False
         for line in lines_for(db, order_id):
+            if line.dropped:
+                continue
+            any_active = True
             if line.reserved:
                 continue
             product = products[line.product_id]
@@ -59,7 +63,9 @@ def inventory(order_id):
                 missing.append(line.id)
         if missing:
             order.had_shortage = True
-        return {"missing_line": missing[0] if missing else None}
+        # all_dropped: every line has been excluded from fulfillment (partial-
+        # fulfillment rejected/no-alternative on every line) — nothing left to ship.
+        return {"missing_line": missing[0] if missing else None, "all_dropped": not any_active}
 
 
 def create_offer(order_id, line_id):
@@ -128,14 +134,43 @@ def apply_offer(order_id, offer_id):
         audit(db, order_id, "replacement_accepted", offer_id=offer_id)
 
 
+def drop_line(order_id, line_id):
+    """Exclude one line from fulfillment (customer rejected its replacement
+    offer, or no compatible alternative existed) without cancelling the rest
+    of the order. Any stock hold on that line's offer is released and, for
+    prepaid orders, the line's paid value is queued for refund."""
+    with SessionLocal.begin() as db:
+        order = db.get(Order, order_id, with_for_update=True)
+        line = db.get(OrderLine, line_id, with_for_update=True)
+        if line.dropped:
+            return  # Idempotent if this node is replayed.
+        offer = db.scalar(select(Offer).where(Offer.line_id == line_id))
+        if offer and offer.held:
+            products = lock_catalog(db)
+            products[offer.product_id].stock += line.quantity
+            offer.held = False
+        if offer and offer.status == "pending":
+            offer.status = offer.decision or "cancelled"
+        line.dropped = True
+        payload = {"line_id": line.id, "product_id": line.original_product_id, "quantity": line.quantity}
+        if order.payment_method == "prepaid":
+            payload["amount_paisa"] = line.original_unit_price_paisa * line.quantity
+            db.add(Outbox(event_key=f"line_drop:{line.id}", order_id=order_id,
+                          kind="partial_refund_request", payload=payload))
+        else:
+            db.add(Outbox(event_key=f"line_drop:{line.id}", order_id=order_id,
+                          kind="line_dropped_cod", payload=payload))
+        audit(db, order_id, "line_dropped", line_id=line.id)
+
+
 def fulfill(order_id):
     with SessionLocal.begin() as db:
         order = db.get(Order, order_id, with_for_update=True)
         if order.status == "ready_for_fulfillment":
             return
-        lines = lines_for(db, order_id)
-        if not all(x.reserved for x in lines):
-            raise ValueError("Cannot fulfill without all inventory reserved")
+        lines = [x for x in lines_for(db, order_id) if not x.dropped]
+        if not lines or not all(x.reserved for x in lines):
+            raise ValueError("Cannot fulfill without all active-line inventory reserved")
         order.final_total_paisa = sum(x.quantity * x.unit_price_paisa for x in lines)
         order.recovered = order.had_shortage
         order.status = "ready_for_fulfillment"
@@ -143,7 +178,9 @@ def fulfill(order_id):
         db.add(Outbox(event_key=f"fulfill:{order_id}", order_id=order_id, kind="fulfillment",
                       payload={"items": [{"product_id": x.product_id, "quantity": x.quantity}
                                          for x in lines], "total_paisa": order.final_total_paisa}))
-        difference = order.original_total_paisa - order.final_total_paisa
+        # Only reflects accepted cheaper-replacement savings on lines that shipped;
+        # any dropped line's refund was already queued separately in drop_line().
+        difference = sum((x.original_unit_price_paisa - x.unit_price_paisa) * x.quantity for x in lines)
         if order.payment_method == "prepaid" and difference > 0:
             db.add(Outbox(event_key=f"adjustment:{order_id}", order_id=order_id,
                           kind="partial_refund_request", payload={"amount_paisa": difference}))
@@ -151,6 +188,9 @@ def fulfill(order_id):
 
 
 def cancel(order_id):
+    """Cancels the whole order: used for a manual-review rejection (nothing
+    reserved yet) and for the all-lines-dropped case under partial fulfillment
+    (each line's holds/refund were already released/queued in drop_line())."""
     with SessionLocal.begin() as db:
         order = db.get(Order, order_id, with_for_update=True)
         if order.status in {"refund_pending", "cancelled_cod"}:
@@ -158,6 +198,9 @@ def cancel(order_id):
         products = lock_catalog(db)
         lines = lines_for(db, order_id)
         by_id = {x.id: x for x in lines}
+        # Refund only lines not already dropped/refunded individually, so a
+        # prior partial refund from drop_line() is never counted twice.
+        refund_paisa = sum(x.original_unit_price_paisa * x.quantity for x in lines if not x.dropped)
         for line in lines:
             if line.reserved:
                 products[line.product_id].stock += line.quantity
@@ -172,6 +215,26 @@ def cancel(order_id):
         order.first_action_at = order.first_action_at or utcnow()
         db.add(Outbox(event_key=f"cancel:{order_id}", order_id=order_id,
                       kind="refund_request" if order.payment_method == "prepaid" else "cancel_cod",
+                      payload={"amount_paisa": refund_paisa if order.payment_method == "prepaid" else 0}))
+        audit(db, order_id, "cancellation_requested", status=order.status)
+
+
+def cancel_before_resolution(order_id):
+    """Customer-initiated cancellation while the order is still `received`
+    (fraud/inventory has not started, nothing is reserved). Disables the job
+    so the worker never picks it up. Returns False if resolution already
+    began, in which case the caller should reject the request."""
+    with SessionLocal.begin() as db:
+        order = db.get(Order, order_id, with_for_update=True)
+        job = db.get(Job, order_id, with_for_update=True)
+        if order.status != "received":
+            return False
+        job.pending = False
+        order.status = "refund_pending" if order.payment_method == "prepaid" else "cancelled_cod"
+        order.first_action_at = order.first_action_at or utcnow()
+        db.add(Outbox(event_key=f"customer_cancel:{order_id}", order_id=order_id,
+                      kind="refund_request" if order.payment_method == "prepaid" else "cancel_cod",
                       payload={"amount_paisa": order.original_total_paisa
                                if order.payment_method == "prepaid" else 0}))
-        audit(db, order_id, "cancellation_requested", status=order.status)
+        audit(db, order_id, "customer_cancelled_before_resolution")
+        return True

@@ -1,24 +1,25 @@
-# OrderOps AI — Grocery Dashboard + Autonomous Resolution
+# OrderOps AI — Grocery Dashboard and Autonomous Resolution
 
 **New:** Screenshot-based grocery dashboard is included. Start FastAPI and open the root `/` page. See [dashboard setup](docs/DASHBOARD_SETUP.md) for upgrading your existing Neon project and demo/live modes.
 
-Roman Urdu mein complete build guide: [docs/STEP_BY_STEP_GUIDE.md](docs/STEP_BY_STEP_GUIDE.md).
+Complete build guide: [docs/STEP_BY_STEP_GUIDE.md](docs/STEP_BY_STEP_GUIDE.md).
 
-Ye runnable learning MVP aap ke BRD ka post-checkout workflow implement karta hai:
+This runnable learning MVP implements the post-checkout workflow:
 FastAPI + LangGraph + PostgreSQL + SQLAlchemy + Alembic. Separate worker orders ko
-process karta hai; customer/auditor ke jawab par graph resume hota hai.
+processes orders; the graph resumes when a customer or auditor responds.
 
-**Scope:** ek missing line ke liye ek discounted alternative; multi-line order mein
-har missing line par workflow repeat hota hai. Reject, expiry, ya no alternative par
-poora order cancel hota hai. Email/SMS, refunds aur warehouse calls local outbox
-records hain. Real integrations connected nahi hain. Fraud score trusted demo
-input hai. Default selection deterministic hai; optional Ollama adapter available hai.
+**Scope:** one discounted alternative is selected for each missing line; the workflow
+repeats for every missing line in a multi-line order. Rejection, expiry, or no
+alternative cancels the full order. Email, SMS, refunds, and warehouse calls are
+stored as local outbox records. Real integrations are not connected. Fraud score is
+trusted demo input. Selection is deterministic by default; an optional Ollama
+adapter is available.
 
 ## Quick start
 
-Python 3.12 aur Docker Compose chahiye. ZIP extract karke `orderops-ai` folder kholen.
+Use Python 3.12 or newer. Docker Compose is optional when using Neon.
 
-Windows Command Prompt:
+Windows PowerShell with Docker Compose:
 
 ```bat
 py -3.12 -m venv .venv
@@ -45,12 +46,12 @@ python -m scripts.demo
 python -m pytest -q
 ```
 
-Swagger: <http://127.0.0.1:8000/docs>. Click **Authorize** and enter `.env` ka
-`ADMIN_API_KEY`. Linux/macOS setup aur manual testing guide mein hai.
+Swagger: <http://127.0.0.1:8000/docs>. Click **Authorize** and enter the
+`ADMIN_API_KEY` value from `.env`.
 
 ## File map
 
-| File | Zimmedari |
+| File | Purpose |
 |---|---|
 | `app/main.py` | API, authentication, callbacks, metrics |
 | `app/config.py`, `app/db.py` | Settings, engine and sessions |

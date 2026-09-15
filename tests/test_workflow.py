@@ -39,7 +39,8 @@ def test_in_stock_and_replay(env):
     assert c.get(f"/orders/{oid}").json()["status"] == "ready_for_fulfillment"
     with dbs() as db:
         assert db.get(Product, 3).stock == 9
-        assert db.scalar(select(func.count()).select_from(Outbox)) == 1
+        # order_confirmation (issued at intake) + fulfillment
+        assert db.scalar(select(func.count()).select_from(Outbox)) == 2
 
 
 def test_customer_accept_updates_price_and_partial_refund(env):
@@ -63,19 +64,45 @@ def test_customer_accept_updates_price_and_partial_refund(env):
     assert metric["revenue_recovery_rate"] == .931
 
 
-def test_reject_releases_all_holds_and_full_refund(env):
+def test_reject_drops_only_that_line_and_fulfills_the_rest(env):
+    # Partial fulfillment: product 1 (no stock) gets rejected; product 3
+    # (in stock) should still ship instead of cancelling the whole order.
     c, dbs, g = env
     oid = create(c, payment="prepaid", items=[{"product_id": 1, "quantity": 2}, {"product_id": 3, "quantity": 1}])
     run(g, oid)
     offer = latest_offer(c, oid)
     assert answer(c, offer, "reject").status_code == 202
     run(g, oid)
-    services.cancel(oid)
+    detail = c.get(f"/orders/{oid}").json()
+    assert detail["status"] == "ready_for_fulfillment"
+    dropped = [x for x in detail["items"] if x["dropped"]]
+    assert len(dropped) == 1 and dropped[0]["product_id"] == 1
+    assert detail["final_total_paisa"] == 60000  # only product 3's line ships
+    with dbs() as db:
+        assert db.get(Product, 2).stock == 20  # offered alternative's hold released
+        assert db.get(Product, 3).stock == 9   # product 3's line still reserved/shipped
+    events = c.get(f"/orders/{oid}/outbox").json()
+    dropped_refund = [e for e in events if e["kind"] == "partial_refund_request"][0]
+    assert dropped_refund["payload"]["amount_paisa"] == 200000  # product 1's line, 2 units @ 1000
+
+
+def test_all_lines_dropped_cancels_whole_order(env):
+    # Both lines fail to resolve -> nothing left to fulfill -> full cancel.
+    c, dbs, g = env
+    oid = create(c, payment="prepaid", items=[{"product_id": 1, "quantity": 1}, {"product_id": 5, "quantity": 1}])
+    run(g, oid)
+    offer = latest_offer(c, oid)
+    assert answer(c, offer, "reject").status_code == 202
+    run(g, oid)
+    detail = c.get(f"/orders/{oid}").json()
+    assert detail["status"] == "refund_pending"
     with dbs() as db:
         assert db.get(Product, 2).stock == 20
-        assert db.get(Product, 3).stock == 10
-        assert db.get(Order, oid).status == "refund_pending"
-        assert db.scalar(select(Outbox).where(Outbox.kind == "refund_request")).payload["amount_paisa"] == 260000
+    events = c.get(f"/orders/{oid}/outbox").json()
+    # No double refund: the cancel-path refund_request should be 0 since both
+    # lines were already refunded individually via drop_line().
+    cancel_refund = [e for e in events if e["kind"] == "refund_request"][0]
+    assert cancel_refund["payload"]["amount_paisa"] == 0
 
 
 def test_fraud_pauses_until_audit_and_approval_continues(env):
@@ -97,7 +124,8 @@ def test_fraud_rejection_cancels_cod(env):
     c.post(f"/orders/{oid}/audit", json={"decision": "reject"})
     run(g, oid)
     assert c.get(f"/orders/{oid}").json()["status"] == "cancelled_cod"
-    assert c.get(f"/orders/{oid}/outbox").json()[0]["kind"] == "cancel_cod"
+    kinds = [e["kind"] for e in c.get(f"/orders/{oid}/outbox").json()]
+    assert "cancel_cod" in kinds
 
 
 def test_no_alternative(env):
@@ -203,7 +231,8 @@ def test_worker_recovers_after_effect_commits_before_checkpoint(env, monkeypatch
     with dbs() as db:
         assert db.get(Product, 2).stock == 19
         assert db.scalar(select(func.count()).select_from(Offer)) == 1
-        assert db.scalar(select(func.count()).select_from(Outbox)) == 1
+        # order_confirmation (issued at intake) + the offer, not duplicated by the retry
+        assert db.scalar(select(func.count()).select_from(Outbox)) == 2
         assert db.get(Job, oid).last_error is None
 
 
