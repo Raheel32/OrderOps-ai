@@ -165,12 +165,29 @@ def create_order(body: OrderInput):
 
 @app.get("/orders/pending", dependencies=[view])
 def orders_pending(kind: str = "all"):
-    """Orders currently sitting in manual_review and/or awaiting_customer,
-    for an admin/auditor worklist. kind: 'audit' | 'customer' | 'all'."""
+    """Orders needing attention, for an admin/auditor worklist.
+    kind: 'audit' | 'customer' | 'all' (order status) | 'failed' (job exhausted
+    its 5 retries and stopped — order.status alone won't show this; only the
+    job row does, so it's queried separately here)."""
+    if kind == "failed":
+        with SessionLocal() as db:
+            jobs = list(db.scalars(select(Job).where(Job.pending.is_(False), Job.attempts >= 5)
+                                   .order_by(Job.available_at)))
+            orders = {o.id: o for o in db.scalars(select(Order).where(
+                Order.id.in_([j.order_id for j in jobs])))}
+            rows = []
+            for j in jobs:
+                row = serialize(orders[j.order_id])
+                row.pop("request_hash", None)
+                row.pop("cancel_token_hash", None)
+                row["job"] = {"attempts": j.attempts, "last_error": j.last_error,
+                              "available_at": j.available_at.isoformat()}
+                rows.append(row)
+            return rows
     statuses = {"audit": ["manual_review"], "customer": ["awaiting_customer"],
                 "all": ["manual_review", "awaiting_customer"]}.get(kind)
     if statuses is None:
-        raise HTTPException(422, "kind must be one of: audit, customer, all")
+        raise HTTPException(422, "kind must be one of: audit, customer, all, failed")
     with SessionLocal() as db:
         orders = list(db.scalars(select(Order).where(Order.status.in_(statuses))
                                  .order_by(Order.created_at)))

@@ -1,5 +1,6 @@
+from datetime import timedelta
 from app import auth
-from app.models import User
+from app.models import Job, User, utcnow
 from tests.test_workflow import answer, create, latest_offer, run
 
 
@@ -104,6 +105,34 @@ def test_auditor_can_decide_audit_but_not_create_orders(env):
 
 
 # --- Pending-orders worklist endpoint ---------------------------------------
+
+def test_orders_pending_failed_surfaces_exhausted_retries(env, monkeypatch):
+    c, dbs, g = env
+    from app import services, worker
+    oid = create(c)
+    monkeypatch.setattr(services, "create_offer",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("simulated permanent failure")))
+    for _ in range(5):
+        with dbs.begin() as db:
+            job = db.get(Job, oid)
+            job.available_at = utcnow() - timedelta(seconds=1)
+        worker.process_one(g)
+    with dbs() as db:
+        job = db.get(Job, oid)
+        assert job.pending is False and job.attempts == 5
+
+    failed = c.get("/orders/pending?kind=failed").json()
+    assert len(failed) == 1 and failed[0]["id"] == oid
+    assert failed[0]["job"]["attempts"] == 5
+    assert "RuntimeError" in failed[0]["job"]["last_error"]
+    assert "cancel_token_hash" not in failed[0]
+
+    assert c.post(f"/orders/{oid}/retry").status_code == 202
+    with dbs() as db:
+        job = db.get(Job, oid)
+        assert job.pending is True and job.attempts == 0 and job.last_error is None
+    assert c.get("/orders/pending?kind=failed").json() == []
+
 
 def test_orders_pending_lists_only_manual_review_and_awaiting_customer(env):
     c, _, g = env
