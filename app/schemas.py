@@ -10,8 +10,9 @@ class LineInput(BaseModel):
 class OrderInput(BaseModel):
     external_id: str = Field(min_length=1, max_length=100)
     customer_email: str = Field(min_length=3, max_length=254)
-    # Supplied by a trusted integration, never by a public checkout user.
-    risk_score: float = Field(ge=0, le=1, allow_inf_nan=False)
+    # Optional: a trusted upstream integration may supply its own score. When
+    # omitted, app.fraud.score() computes it from order data + history.
+    risk_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     payment_method: Literal["cod", "prepaid"] = "cod"
     preferred_brands: list[str] = Field(default_factory=list, max_length=20)
     items: list[LineInput] = Field(min_length=1, max_length=50)

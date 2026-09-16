@@ -2,14 +2,15 @@ import hashlib
 import json
 import secrets
 from pathlib import Path
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
-from app import auth
+from app import auth, fraud
 from app.config import settings
 from app.db import SessionLocal
+from app.integrations import woocommerce
 from app.models import Audit, Job, Offer, Order, OrderLine, Outbox, Product, User, utcnow
 from app.schemas import (AuditDecision, CustomerCancel, CustomerReply, OrderInput,
                           TokenOut, UserCreate, UserLogin)
@@ -122,45 +123,86 @@ def dashboard():
 def create_order(body: OrderInput):
     digest = hashlib.sha256(json.dumps(body.model_dump(), sort_keys=True).encode()).hexdigest()
     with SessionLocal.begin() as db:
-        existing = db.scalar(select(Order).where(Order.external_id == body.external_id))
-        if existing:
-            if existing.request_hash != digest:
-                raise HTTPException(409, "external_id already used with different data")
-            return {"order_id": existing.id, "status": existing.status, "duplicate": True}
-        catalog = {p.id: p for p in db.scalars(select(Product).where(
-            Product.id.in_([x.product_id for x in body.items])))}
-        if len(catalog) != len(body.items):
-            raise HTTPException(422, "Unknown product_id")
-        total = sum(catalog[x.product_id].price_paisa * x.quantity for x in body.items)
-        cancel_token = secrets.token_urlsafe(32)
-        order = Order(external_id=body.external_id, request_hash=digest,
-                      customer_email=body.customer_email, preferred_brands=body.preferred_brands,
-                      risk_score=body.risk_score, payment_method=body.payment_method,
-                      original_total_paisa=total, final_total_paisa=total,
-                      cancel_token_hash=hashlib.sha256(cancel_token.encode()).hexdigest())
-        db.add(order)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            # Another concurrent request may have won the same external ID.
-            with SessionLocal() as retry_db:
-                other = retry_db.scalar(select(Order).where(Order.external_id == body.external_id))
-                if other and other.request_hash == digest:
-                    return {"order_id": other.id, "status": other.status, "duplicate": True}
-            raise HTTPException(409, "external_id conflict")
-        for item in body.items:
-            price = catalog[item.product_id].price_paisa
-            db.add(OrderLine(order_id=order.id, original_product_id=item.product_id,
-                             product_id=item.product_id, quantity=item.quantity,
-                             unit_price_paisa=price, original_unit_price_paisa=price))
-        db.add(Job(order_id=order.id))
-        audit(db, order.id, "order_received")
-        # Demo email: this token is the customer's only way to self-cancel
-        # via POST /orders/{id}/cancel before resolution starts.
-        db.add(Outbox(event_key=f"confirm:{order.id}", order_id=order.id, kind="order_confirmation",
-                      payload={"to": body.customer_email, "cancel_token": cancel_token}))
-        return {"order_id": order.id, "status": "received", "duplicate": False}
+        return _place_order(db, digest, body.external_id, body.customer_email, body.payment_method,
+                            body.preferred_brands, [(x.product_id, x.quantity) for x in body.items],
+                            body.risk_score)
+
+
+def _place_order(db, digest, external_id, customer_email, payment_method, preferred_brands,
+                 items, risk_score=None, billing=None, shipping=None):
+    """Shared by POST /orders and the WooCommerce webhook. `items` is a list
+    of (product_id, quantity) tuples — the caller resolves SKUs to product_id
+    first. `db` must be an open SessionLocal.begin() transaction."""
+    existing = db.scalar(select(Order).where(Order.external_id == external_id))
+    if existing:
+        if existing.request_hash != digest:
+            raise HTTPException(409, "external_id already used with different data")
+        return {"order_id": existing.id, "status": existing.status, "duplicate": True}
+    catalog = {p.id: p for p in db.scalars(select(Product).where(
+        Product.id.in_([pid for pid, _ in items])))}
+    if len(catalog) != len(items):
+        raise HTTPException(422, "Unknown product_id")
+    total = sum(catalog[pid].price_paisa * qty for pid, qty in items)
+    if risk_score is None:
+        risk_score, _reasons = fraud.score(db, customer_email, total, billing, shipping)
+    cancel_token = secrets.token_urlsafe(32)
+    order = Order(external_id=external_id, request_hash=digest,
+                  customer_email=customer_email, preferred_brands=preferred_brands,
+                  risk_score=risk_score, payment_method=payment_method,
+                  original_total_paisa=total, final_total_paisa=total,
+                  cancel_token_hash=hashlib.sha256(cancel_token.encode()).hexdigest())
+    db.add(order)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        # Another concurrent request may have won the same external ID.
+        with SessionLocal() as retry_db:
+            other = retry_db.scalar(select(Order).where(Order.external_id == external_id))
+            if other and other.request_hash == digest:
+                return {"order_id": other.id, "status": other.status, "duplicate": True}
+        raise HTTPException(409, "external_id conflict")
+    for pid, qty in items:
+        price = catalog[pid].price_paisa
+        db.add(OrderLine(order_id=order.id, original_product_id=pid, product_id=pid,
+                         quantity=qty, unit_price_paisa=price, original_unit_price_paisa=price))
+    db.add(Job(order_id=order.id))
+    audit(db, order.id, "order_received")
+    # Demo email: this token is the customer's only way to self-cancel
+    # via POST /orders/{id}/cancel before resolution starts.
+    db.add(Outbox(event_key=f"confirm:{order.id}", order_id=order.id, kind="order_confirmation",
+                  payload={"to": customer_email, "cancel_token": cancel_token}))
+    return {"order_id": order.id, "status": "received", "duplicate": False}
+
+
+@app.post("/webhooks/woocommerce/order-created", status_code=202)
+async def woocommerce_order_created(request: Request):
+    raw_body = await request.body()
+    if not woocommerce.verify_signature(settings.woocommerce_webhook_secret, raw_body,
+                                        request.headers.get("X-WC-Webhook-Signature")):
+        raise HTTPException(401, "Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body)
+        parsed = woocommerce.parse_order(payload)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(422, f"Could not parse WooCommerce order: {exc}")
+
+    with SessionLocal.begin() as db:
+        skus = [i["sku"] for i in parsed["items"]]
+        products = {p.sku: p for p in db.scalars(select(Product).where(Product.sku.in_(skus)))}
+        missing = [s for s in skus if s not in products]
+        if missing:
+            raise HTTPException(422, f"No catalog product mapped to SKU(s): {', '.join(missing)}. "
+                                     f"Set Product.sku for these before this order can be accepted.")
+        # Combine quantities if WooCommerce ever sends the same SKU as two line items.
+        by_product = {}
+        for i in parsed["items"]:
+            pid = products[i["sku"]].id
+            by_product[pid] = by_product.get(pid, 0) + i["quantity"]
+        digest = hashlib.sha256(raw_body).hexdigest()
+        return _place_order(db, digest, parsed["external_id"], parsed["customer_email"],
+                            parsed["payment_method"], [], list(by_product.items()),
+                            risk_score=None, billing=parsed["billing"], shipping=parsed["shipping"])
 
 
 @app.get("/orders/pending", dependencies=[view])

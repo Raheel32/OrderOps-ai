@@ -10,6 +10,14 @@ class Settings(BaseSettings):
     admin_api_key: str = "local-demo-key-change-before-deployment"
     jwt_secret: str = "dev-jwt-secret-change-before-deployment"
     jwt_expire_minutes: int = Field(default=480, ge=1)
+    # WooCommerce order-intake webhook (Settings > Advanced > Webhooks in WP admin).
+    woocommerce_webhook_secret: str = "dev-woocommerce-secret-change-before-deployment"
+    # Rule-based fraud scoring thresholds — tune against real order history.
+    # Weights are fixed in app/fraud.py; these are the trigger conditions.
+    fraud_value_multiple: float = Field(default=3.0, gt=1)  # vs. customer's own average order
+    fraud_new_customer_paisa_threshold: int = Field(default=1_500_000, ge=0)  # ~PKR 15,000
+    fraud_velocity_max_orders: int = Field(default=3, ge=1)
+    fraud_velocity_window_minutes: int = Field(default=60, ge=1)
     risk_threshold: float = Field(default=0.8, ge=0, le=1)
     discount_bps: int = Field(default=500, ge=0, le=1000)
     offer_ttl_hours: int = Field(default=24, ge=1, le=72)

@@ -26,6 +26,10 @@ class Product(Base):
     substitution_group: Mapped[str] = mapped_column(String(100), index=True)
     price_paisa: Mapped[int] = mapped_column(Integer)
     stock: Mapped[int] = mapped_column(Integer)
+    # WooCommerce (or any external store's) SKU, for mapping webhook order
+    # line items to this catalog. Nullable: a product only becomes orderable
+    # via the webhook once you assign it a real SKU.
+    sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
 
 
 class Order(Base):
